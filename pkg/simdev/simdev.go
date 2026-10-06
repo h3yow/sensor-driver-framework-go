@@ -17,14 +17,20 @@ import (
 
 // Behavior 描述设备端一段可编程行为（零值表示理想设备）。
 type Behavior struct {
-	SplitFrames   bool // 将每帧拆成两段发送（制造半包）
-	Sticky        bool // 将多帧合并为一次发送（制造粘包）
-	CorruptEvery  int  // 每 N 帧注入一个 CRC 坏帧（0 表示不注入）
-	BlockAfter    int  // 每发送 N 帧后阻塞 BlockMs 毫秒（0 表示不阻塞）
-	BlockMs       int
-	ReorderWindow int // 在窗口内反转发送顺序（制造时间戳乱序，0/1 表示顺序）
-	TsOffsetMs    int // 时间戳偏移（负值制造过期读数）
-	IntervalMs    int // 帧间隔（默认 10ms）
+	SplitFrames     bool    // 将每帧拆成两段发送（制造半包）
+	Sticky          bool    // 将多帧合并为一次发送（制造粘包）
+	CorruptEvery    int     // 每 N 帧注入一个 CRC 坏帧（0 表示不注入）
+	BlockAfter      int     // 每发送 N 帧后阻塞 BlockMs 毫秒（0 表示不阻塞）
+	BlockMs         int
+	ReorderWindow   int     // 在窗口内反转发送顺序（制造时间戳乱序，0/1 表示顺序）
+	TsOffsetMs      int     // 时间戳偏移（负值制造过期读数）
+	TsDriftMsPerSec float64 // 设备时钟漂移速率（每秒快/慢多少毫秒，0 表示不漂移）
+	TsSpikeEvery    int     // 每 N 帧注入一条时间戳尖峰（0 表示不注入）
+	TsSpikeMs       int     // 尖峰幅度（毫秒）
+	TsJumpAfter     int     // 第 N 帧起设备时钟跳变 TsJumpMs 毫秒（0 表示不跳变）
+	TsJumpMs        int
+	RebootAfter     int // 第 N 帧后模拟设备重启：断开连接，时钟从零重计（0 表示不重启）
+	IntervalMs      int // 帧间隔（默认 10ms）
 }
 
 // PayloadLen 是读数负载长度：ts(8, unixnano BE) + value(8, float64 BE)。
@@ -55,6 +61,35 @@ type Device struct {
 	done chan struct{}
 	once sync.Once
 	wg   sync.WaitGroup
+
+	mu       sync.Mutex
+	rebooted bool      // 是否已模拟重启
+	rebootAt time.Time // 重启时刻（重启后时钟从零重计）
+}
+
+// isRebooted 返回设备是否已模拟重启。
+func (d *Device) isRebooted() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.rebooted
+}
+
+// reboot 标记设备重启并返回重启时刻（仅首次生效）。
+func (d *Device) reboot() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.rebooted {
+		d.rebooted = true
+		d.rebootAt = time.Now()
+	}
+	return d.rebootAt
+}
+
+// uptimeTS 返回重启后的设备时间：自重启起的 uptime（1970 起算，模拟从零重计）。
+func (d *Device) uptimeTS() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return time.Unix(0, time.Since(d.rebootAt).Nanoseconds())
 }
 
 // New 在本地回环地址启动一个模拟设备，按脚本行为发送 frames 帧
@@ -96,8 +131,28 @@ func (d *Device) acceptLoop(name string, b Behavior, frames int) {
 	}
 }
 
+// devTS 计算第 sent 帧的设备时间戳：静态偏移 + 漂移 + 跳变 + 尖峰 + 重启后从零重计。
+func devTS(d *Device, b Behavior, start time.Time, sent int) time.Time {
+	if d.isRebooted() {
+		return d.uptimeTS()
+	}
+	now := time.Now()
+	ts := now.Add(time.Duration(b.TsOffsetMs) * time.Millisecond)
+	if b.TsDriftMsPerSec != 0 {
+		ts = ts.Add(time.Duration(b.TsDriftMsPerSec * now.Sub(start).Seconds() * float64(time.Millisecond)))
+	}
+	if b.TsJumpAfter > 0 && sent >= b.TsJumpAfter {
+		ts = ts.Add(time.Duration(b.TsJumpMs) * time.Millisecond)
+	}
+	if b.TsSpikeEvery > 0 && sent > 0 && sent%b.TsSpikeEvery == 0 {
+		ts = ts.Add(time.Duration(b.TsSpikeMs) * time.Millisecond)
+	}
+	return ts
+}
+
 // serve 按脚本向一条连接发送帧流。
 func (d *Device) serve(name string, conn net.Conn, b Behavior, frames int) {
+	start := time.Now()
 	interval := time.Duration(b.IntervalMs) * time.Millisecond
 	if interval <= 0 {
 		interval = 10 * time.Millisecond
@@ -129,8 +184,14 @@ func (d *Device) serve(name string, conn net.Conn, b Behavior, frames int) {
 			return
 		default:
 		}
+		// 模拟设备重启：断开连接，时钟从零重计（后续连接上报 uptime）
+		if b.RebootAfter > 0 && sent >= b.RebootAfter && !d.isRebooted() {
+			d.reboot()
+			log.Printf("[simdev] device %s rebooting after %d frames: clock restarts from zero", name, sent)
+			return
+		}
 		seq := uint16(sent)
-		ts := time.Now().Add(time.Duration(b.TsOffsetMs) * time.Millisecond)
+		ts := devTS(d, b, start, sent)
 		value := 20.0 + float64(sent%10) // 确定性的模拟读数
 		f := frame.Frame{Type: 0x01, Seq: seq, Payload: EncodePayload(ts, value)}
 		sent++

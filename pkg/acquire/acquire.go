@@ -14,16 +14,21 @@ import (
 	"github.com/h3yow/sensor-driver-framework-go/pkg/driver"
 	"github.com/h3yow/sensor-driver-framework-go/pkg/frame"
 	"github.com/h3yow/sensor-driver-framework-go/pkg/simdev"
+	"github.com/h3yow/sensor-driver-framework-go/pkg/timesync"
 )
 
 // Quality 标记读数可用性。
 type Quality int
 
 const (
-	QualityGood       Quality = iota
-	QualityOutOfOrder         // 时间戳乱序
-	QualityOutOfRange         // 数值越界
-	QualityStale              // 过期读数
+	QualityGood         Quality = iota
+	QualityOutOfOrder           // 时间戳乱序
+	QualityOutOfRange           // 数值越界
+	QualityStale                // 过期读数
+	QualityClockAhead           // 设备时钟明显超前
+	QualityClockBehind          // 设备时钟明显滞后
+	QualityClockInvalid         // 时间戳完全不合理（零值/负值等）
+	QualityClockOutlier         // 时间戳偏离对齐估计但未达超前/滞后阈值
 )
 
 func (q Quality) String() string {
@@ -36,6 +41,14 @@ func (q Quality) String() string {
 		return "OutOfRange"
 	case QualityStale:
 		return "Stale"
+	case QualityClockAhead:
+		return "ClockAhead"
+	case QualityClockBehind:
+		return "ClockBehind"
+	case QualityClockInvalid:
+		return "ClockInvalid"
+	case QualityClockOutlier:
+		return "ClockOutlier"
 	}
 	return "Unknown"
 }
@@ -44,8 +57,13 @@ func (q Quality) String() string {
 type Reading struct {
 	Device  string
 	Value   float64
-	TS      time.Time
+	TS      time.Time // 设备原始时间戳
 	Quality Quality
+
+	// 以下字段仅在启用时间对齐（Config.TimeSync != nil）时有效。
+	AlignedTS time.Time      // 统一时间轴上的时间（Adjusted 为 true 时有效）
+	Adjusted  bool           // 该读数的时间是否被对齐调整过
+	TimeState timesync.State // 该设备当时的对齐状态
 }
 
 // Health 表示设备健康等级。
@@ -79,6 +97,10 @@ type Config struct {
 	IsolateThreshold int     // 连续故障隔离阈值（默认 6）
 	RecoveryRequired int     // 恢复所需连续良好读数（默认 3）
 	RetryBackoffMs   int     // 故障重连退避（默认 100ms）
+
+	// TimeSync 为设备时间对齐配置；nil 表示禁用（默认），
+	// 禁用时判定语义与此前版本完全一致。
+	TimeSync *timesync.Config
 }
 
 func (c *Config) withDefaults() Config {
@@ -116,8 +138,10 @@ type devState struct {
 	health      Health
 	consecFault int
 	consecGood  int
-	lastTS      time.Time // 判定基线：上一条良好读数的时间戳
+	lastTS      time.Time // 判定基线：上一条良好读数的时间戳（启用对齐时为统一时间轴时间）
 	hasBase     bool
+
+	aligner *timesync.Aligner // 时间对齐器（nil 表示禁用时间对齐）
 }
 
 // Manager 并发采集多个设备。
@@ -140,7 +164,11 @@ func NewManagerWithConfig(cfg Config) *Manager {
 func (m *Manager) Add(name, addr string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.devs[name] = &devState{name: name, addr: addr, health: HealthGood}
+	d := &devState{name: name, addr: addr, health: HealthGood}
+	if m.cfg.TimeSync != nil {
+		d.aligner = timesync.New(*m.cfg.TimeSync)
+	}
+	m.devs[name] = d
 }
 
 // HealthOf 返回设备当前健康等级。
@@ -194,6 +222,15 @@ func (m *Manager) loop(d *devState, stop <-chan struct{}, out chan<- Reading) {
 			}
 			continue
 		}
+		// 新连接（含重连）：重建时间序，不沿用故障前的偏差与判定基线
+		if d.aligner != nil {
+			d.aligner.Reset()
+			d.mu.Lock()
+			d.hasBase = false
+			d.lastTS = time.Time{}
+			d.mu.Unlock()
+			log.Printf("[acquire] dev=%s new session: time alignment and baseline reset", d.name)
+		}
 		m.collect(d, sess, stop, out)
 		_ = sess.Close()
 		// 采集循环因故障退出：退避后重连
@@ -232,10 +269,7 @@ func (m *Manager) collect(d *devState, sess *driver.Session, stop <-chan struct{
 			return
 		}
 		for _, f := range dec.Feed(raw) {
-			r, ok := m.judge(d, f)
-			if ok {
-				m.onGood(d)
-			}
+			r := m.judge(d, f)
 			select {
 			case out <- r:
 			case <-stop:
@@ -245,17 +279,66 @@ func (m *Manager) collect(d *devState, sess *driver.Session, stop <-chan struct{
 	}
 }
 
-// judge 对一帧进行可用性判定，返回读数；ok 表示该读数计入健康度良好统计。
-func (m *Manager) judge(d *devState, f frame.Frame) (Reading, bool) {
+// judge 对一帧进行可用性判定并更新健康度，返回读数。
+//
+// 启用时间对齐时：先做时钟异常防护（异常读数不进入判定基线、不计良好），
+// 已对齐的读数在统一时间轴上做乱序/过期判定；未对齐（Aligning）的读数
+// 跳过时间判定且不计入健康度；长期无法对齐（Degraded）按既定策略记故障，
+// 读数被标记为受限（TimeState=Degraded），不应进入跨设备聚合结果。
+func (m *Manager) judge(d *devState, f frame.Frame) Reading {
 	ts, value, valid := simdev.DecodePayload(f.Payload)
 	r := Reading{Device: d.name, Value: value, TS: ts, Quality: QualityGood}
 	if !valid {
 		r.Quality = QualityOutOfRange
 		log.Printf("[acquire] dev=%s seq=%d judge=OutOfRange reason=malformed payload len=%d", d.name, f.Seq, len(f.Payload))
 		m.onFault(d, "malformed payload")
-		return r, false
+		return r
 	}
 	now := time.Now()
+	judgeTS := ts // 用于时间判定的时间（启用对齐且已调整时为统一时间轴时间）
+	if d.aligner != nil {
+		res := d.aligner.Observe(ts, now)
+		r.AlignedTS = res.AlignedTS
+		r.Adjusted = res.Adjusted
+		r.TimeState = res.State
+		if res.Jump {
+			// 时钟跳变：重建时间序，丢弃故障前的判定基线
+			d.mu.Lock()
+			d.hasBase = false
+			d.lastTS = time.Time{}
+			d.mu.Unlock()
+			log.Printf("[acquire] dev=%s seq=%d clock jump: baseline reset", d.name, f.Seq)
+		}
+		switch res.Reason {
+		case timesync.ReasonAhead:
+			r.Quality = QualityClockAhead
+		case timesync.ReasonBehind:
+			r.Quality = QualityClockBehind
+		case timesync.ReasonInvalid:
+			r.Quality = QualityClockInvalid
+		case timesync.ReasonOutlier:
+			r.Quality = QualityClockOutlier
+		}
+		if r.Quality != QualityGood {
+			// 异常读数：不成为比较基准、不计良好（中性），也不污染偏差估计
+			log.Printf("[acquire] dev=%s seq=%d judge=%s reason=clock %s ts=%s",
+				d.name, f.Seq, r.Quality, res.Reason, ts.Format(time.RFC3339Nano))
+			return r
+		}
+		switch res.State {
+		case timesync.StateDegraded:
+			// 长期无法对齐：按既定策略记故障（可降级/隔离），读数受限
+			log.Printf("[acquire] dev=%s seq=%d time sync degraded: reading limited", d.name, f.Seq)
+			m.onFault(d, "time sync degraded")
+			return r
+		case timesync.StateAligning:
+			// 尚未对齐：无法做时间判定，不计入健康度（中性）
+			return r
+		}
+		if res.Adjusted {
+			judgeTS = res.AlignedTS
+		}
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch {
@@ -263,19 +346,31 @@ func (m *Manager) judge(d *devState, f frame.Frame) (Reading, bool) {
 		r.Quality = QualityOutOfRange
 		log.Printf("[acquire] dev=%s seq=%d judge=OutOfRange reason=value %.2f outside [%.2f, %.2f]",
 			d.name, f.Seq, value, m.cfg.MinValue, m.cfg.MaxValue)
-	case d.hasBase && ts.Before(d.lastTS):
+	case d.hasBase && judgeTS.Before(d.lastTS):
 		r.Quality = QualityOutOfOrder
 		log.Printf("[acquire] dev=%s seq=%d judge=OutOfOrder reason=ts %s before last %s",
-			d.name, f.Seq, ts.Format(time.RFC3339Nano), d.lastTS.Format(time.RFC3339Nano))
-	case now.Sub(ts) > time.Duration(m.cfg.StaleAfterMs)*time.Millisecond:
+			d.name, f.Seq, judgeTS.Format(time.RFC3339Nano), d.lastTS.Format(time.RFC3339Nano))
+	case now.Sub(judgeTS) > time.Duration(m.cfg.StaleAfterMs)*time.Millisecond:
 		r.Quality = QualityStale
 		log.Printf("[acquire] dev=%s seq=%d judge=Stale reason=age %v > %dms",
-			d.name, f.Seq, now.Sub(ts), m.cfg.StaleAfterMs)
+			d.name, f.Seq, now.Sub(judgeTS), m.cfg.StaleAfterMs)
 	default:
-		d.lastTS = ts
+		d.lastTS = judgeTS
 		d.hasBase = true
 	}
-	return r, r.Quality == QualityGood
+	if r.Quality == QualityGood {
+		// 内联 onGood 的主体（已持锁）：避免重复加锁
+		d.consecFault = 0
+		d.consecGood++
+		if d.health != HealthGood && d.consecGood >= m.cfg.RecoveryRequired {
+			log.Printf("[acquire] dev=%s health %s -> Good after %d consecutive good readings; baseline reset",
+				d.name, d.health, d.consecGood)
+			d.health = HealthGood
+			d.hasBase = false
+			d.lastTS = time.Time{}
+		}
+	}
+	return r
 }
 
 // onGood 记录一条良好读数，并按策略恢复健康度。
