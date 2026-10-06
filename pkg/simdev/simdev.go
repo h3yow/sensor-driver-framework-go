@@ -24,6 +24,9 @@ type Behavior struct {
 	BlockMs       int
 	ReorderWindow int // 在窗口内反转发送顺序（制造时间戳乱序，0/1 表示顺序）
 	TsOffsetMs    int // 时间戳偏移（负值制造过期读数）
+	TsJumpAfter   int // 发送第 N 帧后时间戳跳变 TsJumpMs（0 表示不跳变）
+	TsJumpMs      int // 跳变幅度（可正可负，模拟运行中时钟跳变）
+	TsFromZero    bool // 时间戳从设备本次启动起算（模拟重启后从零计时）
 	IntervalMs    int // 帧间隔（默认 10ms）
 }
 
@@ -106,6 +109,7 @@ func (d *Device) serve(name string, conn net.Conn, b Behavior, frames int) {
 	var window []frame.Frame // 乱序窗口缓冲
 	var stickyBuf []byte     // 粘包缓冲
 	sentInBlock := 0
+	boot := time.Now() // 本次会话启动时刻（TsFromZero 的计时零点）
 
 	maybeBlock := func() bool {
 		if b.BlockAfter > 0 && b.BlockMs > 0 {
@@ -130,7 +134,19 @@ func (d *Device) serve(name string, conn net.Conn, b Behavior, frames int) {
 		default:
 		}
 		seq := uint16(sent)
-		ts := time.Now().Add(time.Duration(b.TsOffsetMs) * time.Millisecond)
+		var ts time.Time
+		if b.TsFromZero {
+			// 重启后从零计时：以 1970 纪元为起点的相对时间
+			ts = time.Unix(0, time.Since(boot).Nanoseconds())
+		} else {
+			ts = time.Now().Add(time.Duration(b.TsOffsetMs) * time.Millisecond)
+		}
+		if b.TsJumpAfter > 0 && sent >= b.TsJumpAfter {
+			if sent == b.TsJumpAfter {
+				log.Printf("[simdev] device %s clock jumping %dms after %d frames", name, b.TsJumpMs, sent)
+			}
+			ts = ts.Add(time.Duration(b.TsJumpMs) * time.Millisecond)
+		}
 		value := 20.0 + float64(sent%10) // 确定性的模拟读数
 		f := frame.Frame{Type: 0x01, Seq: seq, Payload: EncodePayload(ts, value)}
 		sent++

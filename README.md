@@ -7,11 +7,12 @@
 ## 架构
 
 ```
-cmd/demo        演示入口：五类行为设备并发采集
+cmd/demo        演示入口：多类行为设备（含时钟异常设备）并发采集
 pkg/frame       传输层分帧与容错解析
 pkg/driver      单设备会话生命周期状态机
 pkg/simdev      可编程模拟传感器设备端（TCP，本地回环）
 pkg/acquire     多设备并发采集、可用性判定与健康度管理
+pkg/clockalign  设备时间对齐与时钟异常防护
 ```
 
 ## 设备生命周期语义（pkg/driver）
@@ -58,6 +59,55 @@ CRC 为 CCITT-FALSE，覆盖 TYPE..PAYLOAD。
 | `OutOfRange` | 数值越出 `[MinValue, MaxValue]` 或负载格式非法 |
 | `OutOfOrder` | 时间戳早于本设备上一条良好读数（乱序） |
 | `Stale` | 读数年龄超过 `StaleAfterMs`（过期） |
+| `ClockAhead` | 设备时钟明显超前（启用时钟对齐后） |
+| `ClockBehind` | 设备时钟明显滞后（启用时钟对齐后） |
+| `ClockInvalid` | 时间戳完全不合理，超出硬边界（启用时钟对齐后） |
+| `Unaligned` | 设备时钟未对齐（学习窗口内或长时间无法对齐），数据受限 |
+
+## 设备时间对齐（pkg/clockalign）
+
+默认**关闭**（`Clock.Enabled=false`），不启用时行为与之前完全一致。
+启用后每台设备独立维护一份**固定大小**的时钟状态（EWMA 估计，无历史缓冲，
+长时间运行内存有界）：
+
+- **偏差估计**：以采集端时钟为统一时间基准，用 EWMA 估计设备时钟偏差
+  （`aligned = raw + offset`），`Alpha` 控制平滑系数，能跟上缓慢漂移；
+  偏离当前估计超过 `MaxFutureMs`/`MaxLagMs` 的样本被**拒绝**，不会带偏估计。
+- **统一时间轴**：`Reading.TS` 为对齐后的时间，`Reading.RawTS` 为设备原始
+  时间戳，`Reading.Adjusted` 标记该条是否被调整过，三者均可逐条查询；
+  `Manager.ClockOffsetOf(name)` 可查询设备当前偏差估计。
+  排序、比较、聚合应使用 `TS`。
+- **异常判定**（彼此可区分）：对齐后以“到达时刻 − 估计偏差”推算设备应有
+  时刻，读数偏离超过 `MaxFutureMs` 判 `ClockAhead`，超过 `MaxLagMs` 判
+  `ClockBehind`；任何阶段超出硬边界（早于 `InvalidBeforeMs` 或晚于
+  到达时刻+`HardFutureMs`）判 `ClockInvalid`。
+  异常读数不更新偏差估计，也**不会成为后续读数的判定基线**，因此紧跟在
+  异常后面的正常读数不会被误判为乱序。
+- **跳变与恢复**：连续 `ResetThreshold` 条异常视为时钟跳变/重启重新计时，
+  自动清空偏差估计与判定基线并就地重新学习；若新纪元早于硬下界
+  （设备从零重新计时），自动下调该设备的硬下界以接受新纪元。
+  每次（重）连成功也会重置该设备的时钟状态。恢复后正常累计良好读数，
+  健康度可真正回升到 `Good`，不会卡在降级/隔离。
+- **学习窗口与降级**：攒够 `MinSamples` 个有效样本才建立对齐；建立前的
+  读数标记 `Unaligned` 不进入结果。超过 `AlignTimeoutMs` 仍无法对齐时
+  按既定策略累计故障、降级直至隔离，其数据持续被标记为 `Unaligned`/
+  时钟异常，不会以 `Good` 污染其它设备的聚合结果。
+- **隔离性**：时钟状态按设备独立维护，一台设备的时钟异常或卡顿不影响
+  其它设备采集（`TestClockFaultDeviceDoesNotAffectOthers` 验证）。
+
+可配置项（`acquire.Config.Clock`，零值取默认）：
+
+| 字段 | 默认 | 含义 |
+|---|---|---|
+| `Enabled` | `false` | 是否启用时钟对齐与异常防护 |
+| `MaxFutureMs` | 2000 | 相对估计偏差的超前阈值 |
+| `MaxLagMs` | 5000 | 相对估计偏差的滞后阈值 |
+| `InvalidBeforeMs` | 946684800000（2000-01-01） | 完全不合理硬下界（Unix 毫秒） |
+| `HardFutureMs` | 86400000（24h） | 完全不合理硬上界（相对到达时刻） |
+| `ResetThreshold` | 3 | 连续异常触发时钟重建的条数 |
+| `MinSamples` | 3 | 建立对齐所需最少有效样本 |
+| `Alpha` | 0.2 | 偏差估计 EWMA 平滑系数 |
+| `AlignTimeoutMs` | 30000 | 超过该时长未对齐判定为无法对齐 |
 
 ## 健康度语义（pkg/acquire）
 
@@ -87,7 +137,9 @@ CRC 为 CCITT-FALSE，覆盖 TYPE..PAYLOAD。
 | `CorruptEvery N` | 每 N 帧注入一个 CRC 坏帧 |
 | `BlockAfter N` / `BlockMs` | 每 N 帧后阻塞指定毫秒（设备卡死） |
 | `ReorderWindow N` | 窗口内反转发送顺序（时间戳乱序） |
-| `TsOffsetMs` | 时间戳偏移（负值制造过期读数） |
+| `TsOffsetMs` | 时间戳偏移（负值制造过期读数，正值制造时钟偏快） |
+| `TsJumpAfter N` / `TsJumpMs` | 第 N 帧后时间戳跳变指定毫秒（运行中时钟跳变） |
+| `TsFromZero` | 时间戳从本次启动起算（模拟重启后从零计时） |
 
 ## 本地验证
 
@@ -96,6 +148,7 @@ go build ./...          # 编译
 go vet ./...            # 静态检查
 go test ./...           # 全部单元/集成测试（纯本地，无外部依赖）
 go test ./... -race -count=2   # 竞态检测 + 重复运行，验证结果稳定
+go test ./pkg/clockalign/ ./pkg/acquire/ -run 'Clock|Epoch|Unaligned|Jump' -v  # 时钟对齐与异常防护场景
 go run ./cmd/demo       # 运行 5 秒演示，观察日志与汇总
 ```
 

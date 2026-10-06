@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/h3yow/sensor-driver-framework-go/pkg/clockalign"
 	"github.com/h3yow/sensor-driver-framework-go/pkg/driver"
 	"github.com/h3yow/sensor-driver-framework-go/pkg/frame"
 	"github.com/h3yow/sensor-driver-framework-go/pkg/simdev"
@@ -24,6 +25,10 @@ const (
 	QualityOutOfOrder         // 时间戳乱序
 	QualityOutOfRange         // 数值越界
 	QualityStale              // 过期读数
+	QualityClockAhead         // 设备时钟明显超前
+	QualityClockBehind        // 设备时钟明显滞后
+	QualityClockInvalid       // 时间戳完全不合理
+	QualityUnaligned          // 设备时钟未对齐（学习中或长时间无法对齐）
 )
 
 func (q Quality) String() string {
@@ -36,16 +41,26 @@ func (q Quality) String() string {
 		return "OutOfRange"
 	case QualityStale:
 		return "Stale"
+	case QualityClockAhead:
+		return "ClockAhead"
+	case QualityClockBehind:
+		return "ClockBehind"
+	case QualityClockInvalid:
+		return "ClockInvalid"
+	case QualityUnaligned:
+		return "Unaligned"
 	}
 	return "Unknown"
 }
 
 // Reading 是一条带判定结果的采集读数。
 type Reading struct {
-	Device  string
-	Value   float64
-	TS      time.Time
-	Quality Quality
+	Device   string
+	Value    float64
+	TS       time.Time // 统一时间轴上的时间（未启用时钟对齐时等于 RawTS）
+	RawTS    time.Time // 设备上报的原始时间戳
+	Adjusted bool      // 本次是否按估计偏差调整过时间
+	Quality  Quality
 }
 
 // Health 表示设备健康等级。
@@ -79,6 +94,7 @@ type Config struct {
 	IsolateThreshold int     // 连续故障隔离阈值（默认 6）
 	RecoveryRequired int     // 恢复所需连续良好读数（默认 3）
 	RetryBackoffMs   int     // 故障重连退避（默认 100ms）
+	Clock            clockalign.Config // 设备时钟对齐与异常防护（Enabled=false 时行为与之前一致）
 }
 
 func (c *Config) withDefaults() Config {
@@ -116,8 +132,9 @@ type devState struct {
 	health      Health
 	consecFault int
 	consecGood  int
-	lastTS      time.Time // 判定基线：上一条良好读数的时间戳
+	lastTS      time.Time // 判定基线：上一条良好读数的时间戳（统一时间轴）
 	hasBase     bool
+	clock       *clockalign.DeviceClock // 设备时钟对齐状态（nil 表示未启用）
 }
 
 // Manager 并发采集多个设备。
@@ -140,7 +157,11 @@ func NewManagerWithConfig(cfg Config) *Manager {
 func (m *Manager) Add(name, addr string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.devs[name] = &devState{name: name, addr: addr, health: HealthGood}
+	d := &devState{name: name, addr: addr, health: HealthGood}
+	if m.cfg.Clock.Enabled {
+		d.clock = clockalign.New(m.cfg.Clock)
+	}
+	m.devs[name] = d
 }
 
 // HealthOf 返回设备当前健康等级。
@@ -154,6 +175,19 @@ func (m *Manager) HealthOf(name string) Health {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.health
+}
+
+// ClockOffsetOf 返回设备当前的时钟偏差估计；ok 为 false 表示未启用对齐或尚未对齐。
+func (m *Manager) ClockOffsetOf(name string) (time.Duration, bool) {
+	m.mu.RLock()
+	d, ok := m.devs[name]
+	m.mu.RUnlock()
+	if !ok || d.clock == nil {
+		return 0, false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.clock.Offset()
 }
 
 // Run 启动并发采集，读数投递到 out，直到 stop 关闭后返回。
@@ -193,6 +227,13 @@ func (m *Manager) loop(d *devState, stop <-chan struct{}, out chan<- Reading) {
 				return
 			}
 			continue
+		}
+		// 连接（重连）成功：设备可能已重启并重新计时，重建时钟对齐状态
+		if d.clock != nil {
+			d.mu.Lock()
+			d.clock.Reset()
+			d.mu.Unlock()
+			log.Printf("[acquire] dev=%s clock alignment state reset on (re)connect", d.name)
 		}
 		m.collect(d, sess, stop, out)
 		_ = sess.Close()
@@ -248,7 +289,7 @@ func (m *Manager) collect(d *devState, sess *driver.Session, stop <-chan struct{
 // judge 对一帧进行可用性判定，返回读数；ok 表示该读数计入健康度良好统计。
 func (m *Manager) judge(d *devState, f frame.Frame) (Reading, bool) {
 	ts, value, valid := simdev.DecodePayload(f.Payload)
-	r := Reading{Device: d.name, Value: value, TS: ts, Quality: QualityGood}
+	r := Reading{Device: d.name, Value: value, TS: ts, RawTS: ts, Quality: QualityGood}
 	if !valid {
 		r.Quality = QualityOutOfRange
 		log.Printf("[acquire] dev=%s seq=%d judge=OutOfRange reason=malformed payload len=%d", d.name, f.Seq, len(f.Payload))
@@ -257,24 +298,67 @@ func (m *Manager) judge(d *devState, f frame.Frame) (Reading, bool) {
 	}
 	now := time.Now()
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	if d.clock != nil {
+		// 设备时钟对齐与异常防护：异常读数不更新偏差估计，也不成为判定基线
+		res := d.clock.Align(ts, now)
+		r.TS = res.AlignedTS
+		r.Adjusted = res.Adjusted
+		if res.Reset {
+			// 时钟跳变/重启重新计时：不沿用故障前的判断依据
+			d.hasBase = false
+			d.lastTS = time.Time{}
+			log.Printf("[acquire] dev=%s seq=%d clock jump/restart detected, baseline cleared", d.name, f.Seq)
+		}
+		switch res.Anomaly {
+		case clockalign.AnomalyFuture:
+			r.Quality = QualityClockAhead
+		case clockalign.AnomalyBehind:
+			r.Quality = QualityClockBehind
+		case clockalign.AnomalyInvalid:
+			r.Quality = QualityClockInvalid
+		}
+		if r.Quality != QualityGood {
+			unaligned := res.Unaligned
+			log.Printf("[acquire] dev=%s seq=%d judge=%s reason=clock anomaly %s raw=%s",
+				d.name, f.Seq, r.Quality, res.Anomaly, ts.Format(time.RFC3339Nano))
+			d.mu.Unlock()
+			if unaligned {
+				// 长时间无法对齐：按既定策略累计故障并降级
+				m.onFault(d, "clock unaligned beyond timeout")
+			}
+			return r, false
+		}
+		if !res.Aligned {
+			// 对齐学习中或长时间无法对齐：限制数据进入结果
+			r.Quality = QualityUnaligned
+			unaligned := res.Unaligned
+			log.Printf("[acquire] dev=%s seq=%d judge=Unaligned reason=clock not aligned yet (timeout=%v)",
+				d.name, f.Seq, unaligned)
+			d.mu.Unlock()
+			if unaligned {
+				m.onFault(d, "clock unaligned beyond timeout")
+			}
+			return r, false
+		}
+	}
 	switch {
 	case value < m.cfg.MinValue || value > m.cfg.MaxValue:
 		r.Quality = QualityOutOfRange
 		log.Printf("[acquire] dev=%s seq=%d judge=OutOfRange reason=value %.2f outside [%.2f, %.2f]",
 			d.name, f.Seq, value, m.cfg.MinValue, m.cfg.MaxValue)
-	case d.hasBase && ts.Before(d.lastTS):
+	case d.hasBase && r.TS.Before(d.lastTS):
 		r.Quality = QualityOutOfOrder
 		log.Printf("[acquire] dev=%s seq=%d judge=OutOfOrder reason=ts %s before last %s",
-			d.name, f.Seq, ts.Format(time.RFC3339Nano), d.lastTS.Format(time.RFC3339Nano))
-	case now.Sub(ts) > time.Duration(m.cfg.StaleAfterMs)*time.Millisecond:
+			d.name, f.Seq, r.TS.Format(time.RFC3339Nano), d.lastTS.Format(time.RFC3339Nano))
+	case now.Sub(r.TS) > time.Duration(m.cfg.StaleAfterMs)*time.Millisecond:
 		r.Quality = QualityStale
 		log.Printf("[acquire] dev=%s seq=%d judge=Stale reason=age %v > %dms",
-			d.name, f.Seq, now.Sub(ts), m.cfg.StaleAfterMs)
+			d.name, f.Seq, now.Sub(r.TS), m.cfg.StaleAfterMs)
 	default:
-		d.lastTS = ts
+		d.lastTS = r.TS
 		d.hasBase = true
 	}
+	d.mu.Unlock()
 	return r, r.Quality == QualityGood
 }
 
